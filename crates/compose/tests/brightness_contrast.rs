@@ -61,7 +61,7 @@ fn modern_brightness_contrast_matches_photoshop_ramps_exactly() {
     for (brightness, contrast, expected) in PHOTOSHOP {
         let mut buffer = Buffer { rect: Rect::new(0, 0, 256, 1), px: (0..256).map(|x| [x as f32 / 255.0, x as f32 / 255.0, x as f32 / 255.0, 1.0]).collect() };
         adjust::apply(&Adjustment::BrightnessContrast { brightness, contrast, legacy: false }, &mut buffer);
-        for (x, (pixel, expected)) in buffer.to_rgba8().pixels.chunks_exact(4).zip(expected).enumerate() {
+        for (x, (pixel, expected)) in buffer.to_rgba8().pixels.as_chunks::<4>().0.iter().zip(expected).enumerate() {
             assert_eq!(pixel, &[expected, expected, expected, 255], "b={brightness} c={contrast} input={x}");
         }
     }
@@ -166,7 +166,7 @@ fn clipped_brightness_contrast_render_matches_photoshop() {
     adj.clipped = true;
     doc.layers.push(adj);
     let actual = photocraft_compose::render(&doc, doc.bounds()).to_rgba8();
-    for (pixel, expected) in actual.pixels.chunks_exact(4).zip(PHOTOSHOP[0].2) {
+    for (pixel, expected) in actual.pixels.as_chunks::<4>().0.iter().zip(PHOTOSHOP[0].2) {
         assert_eq!(pixel, &[expected, expected, expected, 255]);
     }
 }
