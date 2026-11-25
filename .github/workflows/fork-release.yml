@@ -1,0 +1,151 @@
+name: Fork release artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_release_id:
+        description: Published storytold/photocraft Release ID for this tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: version
+        name: Check release tag and workspace version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_RELEASE_ID: ${{ inputs.upstream_release_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != wojzj57/photocraft || "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "Run this workflow on a v-prefixed tag in wojzj57/photocraft" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          workspace_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [[ "$workspace_version" != "$version" || "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "Tag, workspace version, and checked-out commit must agree" >&2
+            exit 1
+          fi
+          if [[ ! "$UPSTREAM_RELEASE_ID" =~ ^[0-9]+$ ]]; then
+            echo "Invalid upstream Release ID" >&2
+            exit 1
+          fi
+          upstream_release="$(gh api "repos/storytold/photocraft/releases/$UPSTREAM_RELEASE_ID" --jq '[.tag_name,.draft,.prerelease] | @tsv')"
+          IFS=$'\t' read -r upstream_tag draft prerelease <<< "$upstream_release"
+          if [[ "$upstream_tag" != "$GITHUB_REF_NAME" || "$draft" != false ]]; then
+            echo "Upstream Release ID must identify a public Release with this tag" >&2
+            exit 1
+          fi
+          git fetch --no-tags --filter=blob:none --depth=1 https://github.com/storytold/photocraft.git "refs/tags/$GITHUB_REF_NAME"
+          upstream_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          if [[ "$(git log -1 --format='%(trailers:key=Upstream-Commit,valueonly)' HEAD)" != "$upstream_sha" ||
+                "$(git log -1 --format='%(trailers:key=Upstream-Release-ID,valueonly)' HEAD)" != "$UPSTREAM_RELEASE_ID" ]]; then
+            echo "Release commit does not record this upstream source and Release ID" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  credits:
+    needs: validate
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: storytold/craft-common-actions/.github/workflows/refresh-contributors.yml@1754016e67ca9b74dfa4cf4678b2ac3548e9840f
+
+  platforms:
+    needs: [validate, credits]
+    # GitHub checks the callee's declared permissions even for steps disabled by dry-run.
+    permissions:
+      contents: write
+      packages: write
+    uses: storytold/craft-common-actions/.github/workflows/release.yml@1754016e67ca9b74dfa4cf4678b2ac3548e9840f
+    with:
+      dry-run: true
+      app-name: photocraft
+      app-title: PhotoCraft
+      craft-fonts-ref: cc9269cd8d8258785dac603fba3122e5d2556795
+      contributors-artifact: ${{ needs.credits.outputs.artifact-name }}
+
+  macos:
+    needs: [validate, credits]
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+      CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+      CRAFT_FONTS_REQUIRED: "1"
+      PHOTOCRAFT_BUILD_SHA: ${{ github.sha }}
+      MACOS_SIGN_IDENTITY: "-"
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.credits.outputs.artifact-name }}
+          path: contributors
+      - name: Check out craft-fonts
+        uses: storytold/craft-common-actions/actions/checkout-craft-fonts@1754016e67ca9b74dfa4cf4678b2ac3548e9840f
+        with:
+          ref: cc9269cd8d8258785dac603fba3122e5d2556795
+      - uses: storytold/craft-common-actions/actions/checkout-craft-i18n@1754016e67ca9b74dfa4cf4678b2ac3548e9840f
+      - id: rust
+        uses: storytold/craft-common-actions/actions/rust-channel@1754016e67ca9b74dfa4cf4678b2ac3548e9840f
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: step-security/dtolnay-rust-toolchain@8dd607977d06adf4ed49b190381e74c17a9dd25f # v1.0.0
+        with:
+          toolchain: ${{ steps.rust.outputs.toolchain }}
+          targets: ${{ steps.rust.outputs.targets }}
+          components: ${{ steps.rust.outputs.components }}
+      - name: Build unsigned macOS packages
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fork-release-target
+          DIST: ${{ runner.temp }}/fork-release-dist
+        run: bash packaging/macos/package.sh --arch universal
+      - name: Verify macOS packages
+        env:
+          DIST: ${{ runner.temp }}/fork-release-dist
+        run: bash packaging/macos/verify.sh --arch universal
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-macos
+          path: ${{ runner.temp }}/fork-release-dist/*
+          if-no-files-found: error
+
+  draft:
+    needs: [validate, platforms, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: storytold/craft-common-actions/actions/draft-release@1754016e67ca9b74dfa4cf4678b2ac3548e9840f
+        with:
+          version: ${{ needs.validate.outputs.version }}
+          app-title: PhotoCraft
+          prerelease: ${{ needs.validate.outputs.prerelease }}
+          github-token: ${{ github.token }}
