@@ -197,19 +197,10 @@ fn lut_extended(table: &[f32], v: f32) -> f32 {
     if v < 0.0 { table[0] + v * (table[k] - table[0]) * per_unit } else { table[n - 1] + (v - 1.0) * (table[n - 1] - table[n - 1 - k]) * per_unit }
 }
 
-/// Modern Brightness curve (one channel, `brightness` in [-150, 150]); pins pure black and white,
-/// and `b = 0` is the identity. Raised, it is a line of slope `s = 1.375^(b/50)` from the origin
-/// up to a knee at output 126/255, then a cubic Hermite to (1, 1) whose end slope is
-/// `1 / (1 + 0.084 b)`; past about +110, where no such cubic stays below white, the roll-off is
-/// `1 - (1 - y0)(1 - u)^α` instead (continuous slope `α` at the knee, flat at white). From +109.5
-/// to +150 that curve eases into [`brightness_150`]. Lowered, it is the inverse of the curve
-/// raised by as much.
-///
-/// Fit to every Photoshop measurement we have, all within about a level and a half: its ±50
-/// samples (`modern_brightness_matches_photoshop`), the photoshop corpus's brightness-contrast.psd
-/// (+25 with contrast +30), psd-tools' brightnesscontrast_rgb.psd, whose masked layers give
-/// +23, -31 and -95 (and +150, within 2 levels), and full 8-bit ramps at +150 and -150 (within a
-/// level once rounded).
+/// Modern Brightness curve fitted to RGB/8 and RGB/16 reference ramps.
+/// Raised: a line of slope `2^(b/110)` up to output 0.5, then a Hermite or monotone power
+/// roll-off to white. Above ±109.5 it eases into the measured ±150 endpoint curve.
+/// Lowered: the inverse of the raised curve. Black and white stay pinned.
 pub fn modern_brightness(v: f32, brightness: f32) -> f32 {
     if brightness == 0.0 || !brightness.is_finite() {
         return v;
@@ -238,16 +229,15 @@ struct Roll {
 }
 
 /// Output level of the Brightness curve's knee.
-const BRIGHTNESS_KNEE: f32 = 126.0 / 255.0;
+const BRIGHTNESS_KNEE: f32 = 0.5;
 
-/// The slider value where the curve starts to ease into [`brightness_150`]: the last Hermite
-/// roll-off before the power roll-off takes over (about 109.7). Every curve up to here stays at
-/// or below [`brightness_150`]; the power roll-offs come closer to white past input 220.
+/// The slider value where the calibrated curve starts to ease into [`brightness_150`].
+/// Through this value the calibrated curve stays at or below the endpoint curve.
 const BRIGHTNESS_EASE_FROM: f32 = 109.5;
 
 impl Brightness {
     fn new(brightness: f32) -> Self {
-        let b = brightness.abs();
+        let b = brightness.abs().min(150.0);
         let toward_150 = ((b - BRIGHTNESS_EASE_FROM) / (150.0 - BRIGHTNESS_EASE_FROM)).clamp(0.0, 1.0);
         Brightness { raise: brightness > 0.0, roll: Roll::new(b), toward_150 }
     }
@@ -275,14 +265,8 @@ impl Brightness {
 
     /// The curve raised: the line and its roll-off, eased into [`brightness_150`] past +109.5.
     ///
-    /// Each input must rise with the slider, not only the output with the input. The roll-off
-    /// alone rises with the slider, but past about input 220 the power roll-offs come closer to
-    /// white than [`brightness_150`], so a plain mix of the two fell there as the slider neared
-    /// +150 (input 200 gave 253.55 at +134 and 253.32 at +150). So the ease starts from the
-    /// roll-off held at or below [`brightness_150`]: in `held + t (target - held)` both `held`
-    /// and `t` rise with the slider, and `target - held` is never negative. It is a mix of two
-    /// monotone curves that pin black and white, so it stays monotone and pinned, and reaches
-    /// [`brightness_150`] itself at +150.
+    /// Holding the calibrated curve at or below the endpoint before easing preserves a
+    /// continuous, monotone response to the slider where the curves cross.
     fn raised(&self, x: f32) -> f32 {
         let y = self.roll.eval(x);
         if self.toward_150 <= 0.0 {
@@ -296,8 +280,8 @@ impl Brightness {
 
 impl Roll {
     fn new(b: f32) -> Self {
-        let s = 1.375f32.powf(b / 50.0);
-        let e = 1.0 / (1.0 + 0.084 * b);
+        let s = (b / 110.0).exp2();
+        let e = (1.0 / (12.0 * s - 11.0)).max(0.1);
         let x0 = (BRIGHTNESS_KNEE / s).min(1.0);
         let secant = (1.0 - BRIGHTNESS_KNEE) / (1.0 - x0).max(1e-6);
         let (alpha, beta) = (s / secant, e / secant);
@@ -368,6 +352,10 @@ pub fn modern_lut(brightness: f32, contrast: f32) -> Vec<f32> {
         (0..LUT_SIZE)
             .map(|k| {
                 let y = step(k, LUT_SIZE);
+                // Raised highlights can round to white before the final sample.
+                if k == 0 || k + 1 == LUT_SIZE {
+                    return y;
+                }
                 while j + 2 < fine && ys.get(j + 1).is_some_and(|&n| n < y) {
                     j += 1;
                 }
@@ -380,19 +368,16 @@ pub fn modern_lut(brightness: f32, contrast: f32) -> Vec<f32> {
     bright.into_iter().map(|b| modern_contrast(b, contrast).clamp(0.0, 1.0)).collect()
 }
 
-/// Modern Contrast curve (one channel, `contrast` in [-50, 100]). A symmetric cubic-Hermite S-curve
-/// pivoting at 0.5: endpoint slope `1 - c/128`, centre slope `1 + c/128`. Near-exact vs Photoshop
-/// (≤0.5/255). `c = 0` is the identity; pins 0, 0.5 and 1.
+/// Modern Contrast: two symmetric quadratic segments, pinned at black, middle gray and white.
+/// High-precision reference ramps give `k = 0.0076c`; `c/128` drifts across byte thresholds.
 pub fn modern_contrast(v: f32, contrast: f32) -> f32 {
-    if contrast == 0.0 {
+    if contrast == 0.0 || !contrast.is_finite() {
         return v;
     }
-    let k = contrast / 128.0;
-    let (end, mid) = (1.0 - k, 1.0 + k);
-    // Cubic Hermite on [0, 0.5]: pinned (0,0) slope `end`, (0.5,0.5) slope `mid`. `t` in [0,1].
-    let half = |t: f32| end * 0.5 * (t * t * t - 2.0 * t * t + t) + (-2.0 * t * t * t + 3.0 * t * t) * 0.5 + mid * 0.5 * (t * t * t - t * t);
+    let k = contrast.clamp(-50.0, 100.0) * 0.0076;
+    let half = |x: f32| x + k * (2.0 * x * x - x);
     let v = v.clamp(0.0, 1.0);
-    if v <= 0.5 { half(v / 0.5) } else { 1.0 - half((1.0 - v) / 0.5) }
+    if v <= 0.5 { half(v) } else { 1.0 - half(1.0 - v) }
 }
 
 /// Photoshop posterize: `n` equal input bins over 0..=255, output levels

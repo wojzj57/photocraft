@@ -25,6 +25,8 @@ concurrency:
 jobs:
   # Regenerates contributors/contributors.json for the release commit; every build bundles it.
   credits:
+    # The fork builds unsigned packages from the matching tag using fork-release.yml.
+    if: github.repository != 'wojzj57/photocraft' || github.ref != 'refs/heads/release'
     permissions:
       contents: read
       pull-requests: read
